@@ -4,6 +4,15 @@
 import os, re, ast
 from typing import Optional, Dict, Any
 import streamlit as st
+import difflib
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+    convert_xor,
+    function_exponentiation,
+)
+
 
 # Optional deps (app runs even if missing)
 try:
@@ -70,25 +79,99 @@ MATH_HELP = (
     "- matrix eigenvalues [[1,2],[3,4]]\n"
 )
 
+# ---- Fuzzy keyword correction ----------------------------------------------
+_KEYWORDS = ["derivative", "differentiate", "d/dx",
+             "integral", "integrate",
+             "limit",
+             "solve", "solution", "roots",
+             "simplify", "factor", "expand"]
+
+def fuzzy_fix_keyword(word: str, cutoff=0.75):
+    m = difflib.get_close_matches(word, _KEYWORDS, n=1, cutoff=cutoff)
+    return m[0] if m else word
+
+def fuzzy_fix_ops(text: str) -> str:
+    # fix common misspellings in the first few tokens
+    toks = text.split()
+    if not toks: return text
+    toks[0] = fuzzy_fix_keyword(toks[0].lower())
+    if len(toks) > 1:
+        toks[1] = fuzzy_fix_keyword(toks[1].lower())
+    return " ".join(toks)
+
+# ---- Expression normalizer --------------------------------------------------
+_FUN_WORDS = {
+    "ln": "log",   # SymPy uses log for natural log
+}
+
+def insert_parens_after_func(expr: str) -> str:
+    """
+    Make sinx -> sin(x), sin 2x -> sin(2*x), ln x -> log(x), sqrtx -> sqrt(x)
+    (quick heuristics; good enough for chat UX)
+    """
+    expr = re.sub(r"\b(ln)\b", "log", expr)  # ln -> log
+    # sinx, cosx, tanx, logx, sqrtx  → func(x)
+    for func in ["sin","cos","tan","cot","sec","csc","log","sqrt"]:
+        expr = re.sub(rf"\b{func}\s*([a-zA-Z]\b)", rf"{func}(\1)", expr)     # sin x  -> sin(x)
+        expr = re.sub(rf"\b{func}([a-zA-Z])\b",     rf"{func}(\1)", expr)     # sinx   -> sin(x)
+        # sin 2x -> sin(2*x) ; sin(2x) handled by implicit multiplication
+        expr = re.sub(rf"\b{func}\s*(\d+[a-zA-Z])", rf"{func}(\1)", expr)
+    return expr
+
+def balance_parens(expr: str) -> str:
+    opens = expr.count("(")
+    closes = expr.count(")")
+    if opens > closes:
+        expr = expr + (")" * (opens - closes))
+    return expr
+
+_TRANSFORMS = standard_transformations + (
+    implicit_multiplication_application,  # 2x -> 2*x , (x+1)(x-1) -> ...
+    convert_xor,                          # x^2 stays exponent
+    function_exponentiation,              # sin^2(x) -> sin(x)**2
+)
+
+def try_parse(expr_txt: str):
+    """Robust parse: heuristics + SymPy parse_expr, with graceful fallback."""
+    # basic cleanups
+    s = expr_txt.strip()
+    s = s.replace("’", "'")
+    s = insert_parens_after_func(s)
+    s = balance_parens(s)
+    # let SymPy handle the rest
+    return parse_expr(s, transformations=_TRANSFORMS, evaluate=True)
+
 # ---------- Lightweight regex (local) fallback intent+parse ----------
 def detect_math_op_local(raw: str):
-    t = (raw or "").lower().replace("’","'")
+    """
+    Typo-tolerant intent detection for basic ops.
+    Returns (op, info) where op∈{derivative,integral,limit,solve,simplify,factor,expand,None}.
+    """
+    t = (raw or "").strip()
+    t = fuzzy_fix_ops(t.lower().replace("’","'"))
+
     # derivative
     m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
     if m: return "derivative", {"expr": m.group(1).strip()}
+
     # integral (optional bounds)
     m = re.search(r"(?:integral|integrate)\s+(?:of\s+)?(.+?)\s*(?:from\s+([^\s]+)\s+to\s+([^\s]+))?$", t)
     if m: return "integral", {"expr": m.group(1).strip(), "a": m.group(2), "b": m.group(3)}
+
     # limit
     m = re.search(r"limit\s*(.+?)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", t)
     if m: return "limit", {"expr": m.group(1).strip(), "var": m.group(2), "to": m.group(3)}
+
     # solve
     m = re.search(r"(?:solve|roots|solution)\s+(.+)", t)
     if m: return "solve", {"expr": m.group(1).strip()}
+
     # simplify/factor/expand
     m = re.search(r"(simplify|factor|expand)\s+(.+)", t)
     if m: return m.group(1).lower(), {"expr": m.group(2).strip()}
+
     return None, {}
+
 
 # ---------- LLM router+parser ----------
 LLM_PARSE_SYS = (
