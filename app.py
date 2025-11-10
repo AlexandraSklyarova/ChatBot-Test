@@ -1,21 +1,16 @@
 # app.py — LLM-assisted Math Chatbot (multimodal-ready)
 # Run: streamlit run app.py
 
-import os, re, ast
+import os, re, ast, difflib
 from typing import Optional, Dict, Any
 import streamlit as st
-import difflib
-from sympy.parsing.sympy_parser import (
-    parse_expr,
-    standard_transformations,
-    implicit_multiplication_application,
-    convert_xor,
-    function_exponentiation,
-)
-from dotenv import load_dotenv
-load_dotenv()
 
-
+# env (.env local) — safe for local, harmless on Streamlit Cloud
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 # Optional deps (app runs even if missing)
 try:
@@ -82,7 +77,42 @@ MATH_HELP = (
     "- matrix eigenvalues [[1,2],[3,4]]\n"
 )
 
-# ---- Fuzzy keyword correction ----------------------------------------------
+# ---------------- Pretty rendering helpers ----------------
+def _latex_clean(s: str) -> str:
+    """Normalize common outputs to valid LaTeX."""
+    # \[...\] -> $$...$$
+    s = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", s, flags=re.S)
+    # \to oo -> \to \infty
+    s = re.sub(r"(?<=\\to)\s*oo", r" \\infty", s)
+    s = re.sub(r"\\lim_\{([^}]*)\\to\s*oo\}", r"\\lim_{\1\\to \\infty}", s)
+    # collapse accidental $$$$
+    s = s.replace("$$$$", "$$")
+    return s.strip()
+
+def render_reply(reply: str):
+    """Render mixed text/LaTeX nicely in chat."""
+    if not isinstance(reply, str):
+        st.markdown(str(reply)); return
+    txt = _latex_clean(reply)
+
+    # single display-math block
+    if txt.startswith("$$") and txt.endswith("$$"):
+        st.latex(txt.strip("$"))
+        return
+
+    # split into blocks: $$...$$ as LaTeX, rest as markdown
+    blocks = re.split(r"(\$\$.*?\$\$)", txt, flags=re.S)
+    for b in blocks:
+        if not b:
+            continue
+        if b.startswith("$$") and b.endswith("$"):
+            st.latex(b.strip("$"))
+        elif b.startswith("$$") and b.endswith("$$"):
+            st.latex(b.strip("$"))
+        else:
+            st.markdown(b)
+
+# ---------------- Typo tolerance + robust parsing ----------------
 _KEYWORDS = ["derivative", "differentiate", "d/dx",
              "integral", "integrate",
              "limit",
@@ -94,7 +124,6 @@ def fuzzy_fix_keyword(word: str, cutoff=0.75):
     return m[0] if m else word
 
 def fuzzy_fix_ops(text: str) -> str:
-    # fix common misspellings in the first few tokens
     toks = text.split()
     if not toks: return text
     toks[0] = fuzzy_fix_keyword(toks[0].lower())
@@ -102,32 +131,30 @@ def fuzzy_fix_ops(text: str) -> str:
         toks[1] = fuzzy_fix_keyword(toks[1].lower())
     return " ".join(toks)
 
-# ---- Expression normalizer --------------------------------------------------
-_FUN_WORDS = {
-    "ln": "log",   # SymPy uses log for natural log
-}
-
 def insert_parens_after_func(expr: str) -> str:
     """
-    Make sinx -> sin(x), sin 2x -> sin(2*x), ln x -> log(x), sqrtx -> sqrt(x)
-    (quick heuristics; good enough for chat UX)
+    sinx -> sin(x), sin 2x -> sin(2*x), ln x -> log(x), sqrtx -> sqrt(x)
     """
     expr = re.sub(r"\b(ln)\b", "log", expr)  # ln -> log
-    # sinx, cosx, tanx, logx, sqrtx  → func(x)
     for func in ["sin","cos","tan","cot","sec","csc","log","sqrt"]:
-        expr = re.sub(rf"\b{func}\s*([a-zA-Z]\b)", rf"{func}(\1)", expr)     # sin x  -> sin(x)
-        expr = re.sub(rf"\b{func}([a-zA-Z])\b",     rf"{func}(\1)", expr)     # sinx   -> sin(x)
-        # sin 2x -> sin(2*x) ; sin(2x) handled by implicit multiplication
-        expr = re.sub(rf"\b{func}\s*(\d+[a-zA-Z])", rf"{func}(\1)", expr)
+        expr = re.sub(rf"\b{func}\s*([a-zA-Z]\b)", rf"{func}(\1)", expr)     # sin x -> sin(x)
+        expr = re.sub(rf"\b{func}([a-zA-Z])\b",     rf"{func}(\1)", expr)     # sinx  -> sin(x)
+        expr = re.sub(rf"\b{func}\s*(\d+[a-zA-Z])", rf"{func}(\1)", expr)     # sin 2x -> sin(2x)
     return expr
 
 def balance_parens(expr: str) -> str:
-    opens = expr.count("(")
-    closes = expr.count(")")
+    opens = expr.count("("); closes = expr.count(")")
     if opens > closes:
         expr = expr + (")" * (opens - closes))
     return expr
 
+from sympy.parsing.sympy_parser import (
+    parse_expr,
+    standard_transformations,
+    implicit_multiplication_application,
+    convert_xor,
+    function_exponentiation,
+)
 _TRANSFORMS = standard_transformations + (
     implicit_multiplication_application,  # 2x -> 2*x , (x+1)(x-1) -> ...
     convert_xor,                          # x^2 stays exponent
@@ -135,16 +162,14 @@ _TRANSFORMS = standard_transformations + (
 )
 
 def try_parse(expr_txt: str):
-    """Robust parse: heuristics + SymPy parse_expr, with graceful fallback."""
-    # basic cleanups
-    s = expr_txt.strip()
-    s = s.replace("’", "'")
+    """Heuristics + SymPy parse_expr, with graceful fallback."""
+    s = (expr_txt or "").strip().replace("’", "'")
     s = insert_parens_after_func(s)
     s = balance_parens(s)
-    # let SymPy handle the rest
-    return parse_expr(s, transformations=_TRANSFORMS, evaluate=True)
+    # Treat 'e' as Euler's number
+    locals_map = {"e": sp.E} if sp else {}
+    return parse_expr(s, transformations=_TRANSFORMS, evaluate=True, local_dict=locals_map)
 
-# ---------- Lightweight regex (local) fallback intent+parse ----------
 def detect_math_op_local(raw: str):
     """
     Typo-tolerant intent detection for basic ops.
@@ -175,8 +200,7 @@ def detect_math_op_local(raw: str):
 
     return None, {}
 
-
-# ---------- LLM router+parser ----------
+# ---------- LLM router+parser (optional) ----------
 LLM_PARSE_SYS = (
     "You convert natural-language math questions into a JSON instruction for a CAS (SymPy). "
     "Return compact JSON with keys: op in {derivative,integral,limit,solve,simplify,factor,expand,none}, "
@@ -186,11 +210,9 @@ LLM_PARSE_SYS = (
 )
 
 def llm_parse_math(raw: str) -> Dict[str, Any]:
-    """Use LLM to robustly parse messy user text into a CAS-ready plan."""
     if not OPENAI_AVAILABLE:
         return {"op":"none"}
     try:
-        prompt = f"User: {raw}\nReturn JSON only."
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role":"system","content":LLM_PARSE_SYS},
@@ -198,17 +220,14 @@ def llm_parse_math(raw: str) -> Dict[str, Any]:
             temperature=0.0,
         )
         text = resp.choices[0].message.content.strip()
-        # Extract JSON (tolerate leading/trailing text just in case)
         import json
         start = text.find("{"); end = text.rfind("}")
         obj = json.loads(text[start:end+1]) if start!=-1 and end!=-1 else json.loads(text)
-        # normalize
         obj.setdefault("op","none")
         return obj
     except Exception:
         return {"op":"none"}
 
-# ---------- LLM explainer (optional pretty steps) ----------
 LLM_EXPLAIN_SYS = (
     "You are a math TA. Given a user's question and CAS result, explain steps clearly in 3-6 short bullets. "
     "Use LaTeX inline when helpful; keep it concise."
@@ -236,31 +255,35 @@ def _parse_matrix(txt: str):
         return None
 
 def do_sympy_compute(op: str, info: Dict[str, Any]) -> str:
-    """Run the CAS operation with SymPy based on parsed plan."""
+    """Run the CAS operation with SymPy based on parsed plan (pretty LaTeX)."""
     if sp is None:
         return "SymPy isn't installed. Add `sympy` to requirements.txt."
     x, y, z, n, t = sp.symbols("x y z n t")
 
     if op == "derivative":
-        expr = sp.sympify(info["expr"])
-        return f"d/dx {expr} = {sp.simplify(sp.diff(expr, x))}"
+        expr = try_parse(info["expr"])
+        deriv = sp.simplify(sp.diff(expr, x))
+        return f"$$\\frac{{d}}{{dx}}\\,{to_latex(expr)} = {to_latex(deriv)}$$"
 
     if op == "integral":
-        expr = sp.sympify(info["expr"])
+        expr = try_parse(info["expr"])
         a, b = info.get("a"), info.get("b")
         if a and b:
-            val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
-            return f"∫[{a},{b}] {expr} dx = {sp.simplify(val)}"
-        else:
-            return f"∫ {expr} dx = {sp.simplify(sp.integrate(expr, x))} + C"
+            aval = try_parse(a); bval = try_parse(b)
+            val = sp.simplify(sp.integrate(expr, (x, aval, bval)))
+            return f"$$\\int_{{{to_latex(aval)}}}^{{{to_latex(bval)}}} {to_latex(expr)}\\,dx = {to_latex(val)}$$"
+        ant = sp.simplify(sp.integrate(expr, x))
+        return f"$$\\int {to_latex(expr)}\\,dx = {to_latex(ant)} + C$$"
 
     if op == "limit":
         var = sp.Symbol(info.get("var","x"))
-        expr = sp.sympify(info["expr"])
+        expr = try_parse(info["expr"])
         to_txt = info.get("to","oo")
-        to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else (-sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt))
-        res = sp.limit(expr, var, to_val)
-        return f"limit {expr} as {var}->{to_txt} = {sp.simplify(res)}"
+        to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else \
+                 -sp.oo if to_txt in ["-oo","-inf"] else try_parse(to_txt)
+        pretty_to = r"\infty" if to_val == sp.oo else (r"-\infty" if to_val == -sp.oo else to_latex(to_val))
+        res = sp.simplify(sp.limit(expr, var, to_val))
+        return f"$$\\lim_{{{to_latex(var)}\\to {pretty_to}}} {to_latex(expr)} = {to_latex(res)}$$"
 
     if op == "solve":
         expr_txt = info["expr"]
@@ -270,137 +293,70 @@ def do_sympy_compute(op: str, info: Dict[str, Any]) -> str:
             symset, parsed = set(), []
             for e in eqs:
                 L, R = e.split("=")
-                parsed.append(sp.Eq(sp.sympify(L), sp.sympify(R)))
-                symset |= sp.sympify(L).free_symbols | sp.sympify(R).free_symbols
+                Lp, Rp = try_parse(L), try_parse(R)
+                parsed.append(sp.Eq(Lp, Rp))
+                symset |= Lp.free_symbols | Rp.free_symbols
             sol = sp.solve(parsed, list(symset))
             return f"Solutions: {sol}"
         if "=" in expr_txt:
             L, R = expr_txt.split("=", 1)
-            sol = sp.solve(sp.Eq(sp.sympify(L), sp.sympify(R)))
+            sol = sp.solve(sp.Eq(try_parse(L), try_parse(R)))
         else:
-            sol = sp.solve(sp.sympify(expr_txt))
+            sol = sp.solve(try_parse(expr_txt))
         return f"Solutions: {sol}"
 
     if op in {"simplify","factor","expand"}:
-        expr = sp.sympify(info["expr"])
-        if op == "factor":  return f"factor({expr}) = {sp.factor(expr)}"
-        if op == "expand":  return f"expand({expr}) = {sp.expand(expr)}"
-        return f"simplify({expr}) = {sp.simplify(expr)}"
+        expr = try_parse(info["expr"])
+        if op == "factor":  return f"$$\\mathrm{{factor}}\\big({to_latex(expr)}\\big) = {to_latex(sp.factor(expr))}$$"
+        if op == "expand":  return f"$$\\mathrm{{expand}}\\big({to_latex(expr)}\\big) = {to_latex(sp.expand(expr))}$$"
+        return f"$$\\mathrm{{simplify}}\\big({to_latex(expr)}\\big) = {to_latex(sp.simplify(expr))}$$"
 
     return "I couldn't parse that.\n\n" + MATH_HELP
 
-# ---------- Unified math_engine (matches call: math_engine(user_text, use_llm=...)) ----------
-import re
-
 def math_engine(prompt: str, use_llm: bool = True) -> str:
     """
-    Hybrid: try SymPy first; if it fails and LLM is enabled/available,
-    ask the LLM for an explanation or to fix the input.
-    This signature matches: math_engine(user_text, use_llm=use_llm)
+    1) Try to parse intent locally (typo tolerant).
+    2) Execute with SymPy (robust parser).
+    3) If that fails and LLM is enabled, ask LLM to parse/explain, then compute again if possible.
     """
     if sp is None:
         return "SymPy isn't installed. Add `sympy` to requirements.txt."
 
-    x = sp.Symbol("x")
-    raw = prompt.strip()
-    lower = raw.lower()
+    # 1) Plan via local detector
+    op, info = detect_math_op_local(prompt)
+    plan = {"op": op or "none", **(info or {})}
 
-    # --- light normalization so 'sinx' -> 'sin(x)', 'ln x' -> 'log(x)' ---
-    def normalize_expr(s: str) -> str:
-        s = s.replace("ln", "log")
-        # sinx, cosx, tanx, logx, sqrtx, sin x, etc.
-        for f in ["sin","cos","tan","cot","sec","csc","log","sqrt"]:
-            s = re.sub(rf"\b{f}\s*([a-zA-Z]\b)", rf"{f}(\1)", s)
-            s = re.sub(rf"\b{f}([a-zA-Z])\b", rf"{f}(\1)", s)
-        # balance missing right parens
-        opens = s.count("("); closes = s.count(")")
-        if opens > closes: s += ")" * (opens - closes)
-        return s
-
-    # ---------- 1) Try SymPy path ----------
-    try:
-        # derivative
-        if any(k in lower for k in ["derivative", "differentiate", "d/dx"]):
-            expr_txt = re.sub(r"(?i)(derivative\s+of|differentiate|d/dx)\s*", "", raw).strip()
-            expr_txt = normalize_expr(expr_txt)
-            expr = sp.sympify(expr_txt)
-            deriv = sp.diff(expr, x)
-            return f"d/dx {sp.latex(expr)} = {sp.latex(deriv)}"
-
-        # integral (supports “from a to b”)
-        if "integral" in lower or "integrate" in lower:
-            expr_txt = re.sub(r"(?i)(integral\s+of|integrate)\s*", "", raw).strip()
-            m = re.search(r"from\s+([^\s]+)\s+to\s+([^\s]+)$", expr_txt, flags=re.I)
-            expr_core = expr_txt[:m.start()].strip() if m else expr_txt
-            expr_core = normalize_expr(expr_core)
-            expr = sp.sympify(expr_core, locals={"e": sp.E})
-
-            if m:
-                a, b = m.group(1), m.group(2)
-                val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
-                return f"\\int_{{{a}}}^{{{b}}} {sp.latex(expr)}\\,dx = {sp.latex(sp.simplify(val))}"
-            ant = sp.integrate(expr, x)
-            return f"\\int {sp.latex(expr)}\\,dx = {sp.latex(sp.simplify(ant))} + C"
-
-        # limit: e.g. "limit (1+1/n)^n as n->oo"
-        if "limit" in lower and "->" in raw:
-            m = re.search(r"limit\s*(.+)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", raw, flags=re.I)
-            if m:
-                expr_txt, var_txt, to_txt = m.groups()
-                expr_txt = normalize_expr(expr_txt)
-                var = sp.Symbol(var_txt)
-                expr = sp.sympify(expr_txt)
-                to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else \
-                         -sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt)
-                val = sp.limit(expr, var, to_val)
-                return f"\\lim_{{{var}\\to {to_txt}}} {sp.latex(expr)} = {sp.latex(sp.simplify(val))}"
-
-        # algebra helpers
-        if lower.startswith("solve "):
-            expr_txt = raw[6:].strip()
-            if "=" in expr_txt:
-                L, R = expr_txt.split("=", 1)
-                sol = sp.solve(sp.Eq(sp.sympify(normalize_expr(L)), sp.sympify(normalize_expr(R))))
-            else:
-                sol = sp.solve(sp.sympify(normalize_expr(expr_txt)))
-            return f"Solutions: {sol}"
-
-        if lower.startswith("simplify ") or lower.startswith("factor ") or lower.startswith("expand "):
-            op = "simplify" if lower.startswith("simplify ") else "factor" if lower.startswith("factor ") else "expand"
-            expr_txt = re.sub(r"(?i)(simplify|factor|expand)\s*", "", raw).strip()
-            expr = sp.sympify(normalize_expr(expr_txt))
-            if op == "factor":  return f"factor({sp.latex(expr)}) = {sp.latex(sp.factor(expr))}"
-            if op == "expand":  return f"expand({sp.latex(expr)}) = {sp.latex(sp.expand(expr))}"
-            return f"simplify({sp.latex(expr)}) = {sp.latex(sp.simplify(expr))}"
-
-        # bare expression: show simplified result
-        expr = sp.sympify(normalize_expr(raw))
-        return f"Parsed: ${sp.latex(expr)}$\\nSimplified: ${sp.latex(sp.simplify(expr))}$"
-
-    except Exception:
-        # fall through to LLM if allowed
-        pass
-
-    # ---------- 2) LLM fallback (for typos, 'why' questions, explanations) ----------
-    if use_llm and 'OPENAI_AVAILABLE' in globals() and OPENAI_AVAILABLE:
+    # 2) Compute with SymPy if possible
+    if plan["op"] != "none":
         try:
-            resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a helpful math tutor. "
-                        "If the user asks 'why' or writes messy math, fix it and explain. "
-                        "Prefer concise steps and LaTeX when helpful."
-                    )},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
-            return f"LLM error: {e}"
+            return do_sympy_compute(plan["op"], plan)
+        except Exception:
+            pass
 
-    # ---------- 3) Last resort ----------
+    # 3) LLM-assisted parsing + explanation (optional)
+    if use_llm and OPENAI_AVAILABLE:
+        plan = llm_parse_math(prompt)
+        if plan.get("op") != "none":
+            try:
+                result = do_sympy_compute(plan["op"], plan)
+                expl = llm_explain(prompt, result)
+                return result + ("\n\n" + expl if expl else "")
+            except Exception:
+                # fall back to direct LLM answer (reason/explain)
+                try:
+                    resp = client.chat.completions.create(
+                        model=OPENAI_MODEL,
+                        messages=[
+                            {"role":"system","content":"You are a helpful math tutor. Use LaTeX for math, be concise."},
+                            {"role":"user","content":prompt}
+                        ],
+                        temperature=0.2,
+                    )
+                    return resp.choices[0].message.content.strip()
+                except Exception as e:
+                    return f"LLM error: {e}"
+
+    # Last resort
     return "I couldn't parse that.\n\n" + MATH_HELP
 
 # ---------------- Upload Handlers (stubs) ----------------
@@ -437,13 +393,15 @@ pdf_file = st.sidebar.file_uploader("Upload lecture PDF", type=["pdf"])
 st.sidebar.markdown("---")
 st.sidebar.subheader("LLM settings")
 use_llm = st.sidebar.checkbox("Use LLM assistance (better parsing + explanations)", value=True)
+st.sidebar.markdown("### 🔐 OpenAI status")
+st.sidebar.write("✅ Connected" if OPENAI_AVAILABLE else "❌ No API key found")
 if use_llm and not OPENAI_AVAILABLE:
-    st.sidebar.warning("Set OPENAI_API_KEY env var or Streamlit secret to enable LLM.")
+    st.sidebar.warning("Set OPENAI_API_KEY via .env (local) or Streamlit Secrets (cloud).")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Examples")
-st.sidebar.code("derivative of x^2", language="text")
-st.sidebar.code("integrate x^2 from 0 to 1", language="text")
+st.sidebar.code("derivative of sinx", language="text")
+st.sidebar.code("integrate e^x", language="text")
 st.sidebar.code("limit (1+1/n)^n as n->oo", language="text")
 st.sidebar.code("solve {x+y=3, x-y=1}", language="text")
 st.sidebar.code("matrix eigenvalues [[1,2],[3,4]]", language="text")
@@ -451,7 +409,7 @@ st.sidebar.code("matrix eigenvalues [[1,2],[3,4]]", language="text")
 # ---------------- Chat history ----------------
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
-        st.write(m["content"])
+        render_reply(m["content"])
 
 # ---------------- Input & Routing ----------------
 user_text = st.chat_input("Type your math question or instruction…")
@@ -459,7 +417,7 @@ user_text = st.chat_input("Type your math question or instruction…")
 if user_text:
     st.session_state.messages.append({"role": "user", "content": user_text})
     with st.chat_message("user"):
-        st.write(user_text)
+        render_reply(user_text)
 
     intent = infer_intent(
         user_text,
@@ -479,12 +437,4 @@ if user_text:
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
     with st.chat_message("assistant"):
-        # if the reply contains LaTeX, render it nicely
-        if "\\" in reply or "$" in reply:
-            try:
-                st.latex(reply.replace("$$", "$"))  # handles inline and block
-            except Exception:
-                st.markdown(reply)
-        else:
-            st.markdown(reply)
-
+        render_reply(reply)
