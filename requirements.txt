@@ -1,3 +1,4 @@
 streamlit>=1.35
 sympy>=1.12
 PyPDF2>=3.0
+openai>=1.37.0
