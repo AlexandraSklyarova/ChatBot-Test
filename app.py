@@ -36,8 +36,8 @@ except Exception:
 
 # ---------------- UI ----------------
 st.set_page_config(page_title="LLM Math Chatbot", page_icon="🧮", layout="wide")
-st.title("🧮 Math Chatbot — LLM assisted (multimodal-ready)")
-st.caption("Understands natural questions via an LLM, computes exactly with SymPy. Upload image/audio/PDF if you want; I’ll route automatically.")
+st.title("Math Chatbot")
+st.caption("Understands natural questions via an LLM, computes exactly with SymPy.")
 
 # ---------------- State ----------------
 if "messages" not in st.session_state:
