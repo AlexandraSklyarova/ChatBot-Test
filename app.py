@@ -12,6 +12,9 @@ from sympy.parsing.sympy_parser import (
     convert_xor,
     function_exponentiation,
 )
+from dotenv import load_dotenv
+load_dotenv()
+
 
 
 # Optional deps (app runs even if missing)
