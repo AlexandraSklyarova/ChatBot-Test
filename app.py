@@ -66,6 +66,35 @@ def extract_expression(text: str) -> str:
             # handle "as x->..." for limits (keep it in full query; math_engine handles)
             return expr if not p.startswith("limit") else text
     return text
+    
+def detect_math_op(raw: str):
+    """
+    Return (op, payload) where op in {'derivative','integral','limit','solve','simplify',None}.
+    payload is a dict with fields used by the op.
+    """
+    t = (raw or "").lower().replace("’","'")
+    # derivative
+    m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
+    if m:
+        return "derivative", {"expr": m.group(1).strip()}
+    # integral (definite: "... from a to b")
+    m = re.search(r"(?:integral|integrate)\s+(?:of\s+)?(.+?)\s*(?:from\s+([^\s]+)\s+to\s+([^\s]+))?$", t)
+    if m:
+        return "integral", {"expr": m.group(1).strip(), "a": m.group(2), "b": m.group(3)}
+    # limit: "limit (expr) as x->value"
+    m = re.search(r"limit\s*(.+?)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", t)
+    if m:
+        return "limit", {"expr": m.group(1).strip(), "var": m.group(2), "to": m.group(3)}
+    # solve (systems allowed later)
+    m = re.search(r"(?:solve|roots|solution)\s+(.+)", t)
+    if m:
+        return "solve", {"expr": m.group(1).strip()}
+    # simplify/factor/expand
+    m = re.search(r"(simplify|factor|expand)\s+(.+)", t)
+    if m:
+        return m.group(1).lower(), {"expr": m.group(2).strip()}
+    return None, {}
+
 
 def infer_intent(text: str, has_image: bool, has_audio: bool, has_pdf: bool) -> str:
     t = (text or "").lower()
@@ -104,11 +133,89 @@ def math_engine(query: str) -> str:
     if sp is None:
         return "SymPy isn't installed. Add `sympy` to requirements.txt."
 
-    # Natural-language cleanup first
-    query = extract_expression(query)
+    # 1) Detect op on the RAW text
+    op, info = detect_math_op(query)
+
+    # 2) Then extract the expression (for nicer NL handling)
+    cleaned = extract_expression(query)
+    q = (cleaned or "").strip()
 
     x, y, z, n, t = sp.symbols("x y z n t")
-    q = (query or "").strip()
+
+    # ---------- DERIVATIVE ----------
+    if op == "derivative":
+        try:
+            expr = sp.sympify(info["expr"])
+            return f"d/dx {expr} = {sp.simplify(sp.diff(expr, x))}"
+        except Exception as e:
+            return f"Could not differentiate: {e}"
+
+    # ---------- INTEGRAL ----------
+    if op == "integral":
+        try:
+            expr = sp.sympify(info["expr"])
+            a, b = info.get("a"), info.get("b")
+            if a and b:
+                val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
+                return f"∫[{a},{b}] {expr} dx = {sp.simplify(val)}"
+            else:
+                return f"∫ {expr} dx = {sp.simplify(sp.integrate(expr, x))} + C"
+        except Exception as e:
+            return f"Could not compute integral: {e}"
+
+    # ---------- LIMIT ----------
+    if op == "limit":
+        try:
+            var = sp.Symbol(info["var"])
+            expr = sp.sympify(info["expr"])
+            to_txt = info["to"]
+            to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else (-sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt))
+            res = sp.limit(expr, var, to_val)
+            return f"limit {expr} as {var}->{to_txt} = {sp.simplify(res)}"
+        except Exception as e:
+            return f"Could not compute limit: {e}"
+
+    # ---------- SOLVE / SIMPLIFY / FACTOR / EXPAND ----------
+    if op == "solve":
+        try:
+            expr_txt = info["expr"]
+            if "{" in expr_txt and "}" in expr_txt:
+                inside = expr_txt[expr_txt.find("{")+1:expr_txt.rfind("}")]
+                eqs = [e.strip() for e in inside.split(",")]
+                symset, parsed = set(), []
+                for e in eqs:
+                    L, R = e.split("=")
+                    parsed.append(sp.Eq(sp.sympify(L), sp.sympify(R)))
+                    symset |= sp.sympify(L).free_symbols | sp.sympify(R).free_symbols
+                sol = sp.solve(parsed, list(symset))
+                return f"Solutions: {sol}"
+            if "=" in expr_txt:
+                L, R = expr_txt.split("=", 1)
+                sol = sp.solve(sp.Eq(sp.sympify(L), sp.sympify(R)))
+            else:
+                sol = sp.solve(sp.sympify(expr_txt))
+            return f"Solutions: {sol}"
+        except Exception as e:
+            return f"Could not solve: {e}"
+
+    if op in {"simplify","factor","expand"}:
+        try:
+            expr = sp.sympify(info["expr"])
+            if op == "factor":  return f"factor({expr}) = {sp.factor(expr)}"
+            if op == "expand":  return f"expand({expr}) = {sp.expand(expr)}"
+            return f"simplify({expr}) = {sp.simplify(expr)}"
+        except Exception as e:
+            return f"Could not process expression: {e}"
+
+    # ---------- (rest of your handlers: matrix, number theory, fallback, etc.) ----------
+    # keep your existing matrix/number-theory blocks here...
+    # Fallback:
+    try:
+        expr = sp.sympify(q)
+        return f"Parsed: ${to_latex(expr)}$\nSimplified: ${to_latex(sp.simplify(expr))}$"
+    except Exception:
+        return "I couldn't parse that.\n\n" + MATH_HELP
+
 
     # ---- Matrix helpers ----
     if "matrix" in q.lower() or q.strip().startswith("[["):
