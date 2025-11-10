@@ -1,11 +1,11 @@
-# app.py — Math Chatbot (multimodal-ready) with natural-language parsing
+# app.py — LLM-assisted Math Chatbot (multimodal-ready)
 # Run: streamlit run app.py
 
-import io, os, re, ast
-from typing import Optional, List
+import os, re, ast
+from typing import Optional, Dict, Any
 import streamlit as st
 
-# Optional deps (the app still runs if missing)
+# Optional deps (app runs even if missing)
 try:
     import sympy as sp
 except Exception:
@@ -15,14 +15,26 @@ try:
 except Exception:
     PyPDF2 = None
 
+# ---- Optional LLM client (OpenAI SDK v1 style) ----
+OPENAI_AVAILABLE = False
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # pick any chat model you have
+try:
+    from openai import OpenAI
+    _OPENAI_KEY = os.getenv("OPENAI_API_KEY", st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None)
+    if _OPENAI_KEY:
+        client = OpenAI(api_key=_OPENAI_KEY)
+        OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
 # ---------------- UI ----------------
-st.set_page_config(page_title="Math Chatbot (Multimodal)", page_icon="🧮", layout="wide")
-st.title("Math Chatbot")
-st.caption("Ask math questions, or upload an image/audio/PDF; the assistant routes automatically.")
+st.set_page_config(page_title="LLM Math Chatbot", page_icon="🧮", layout="wide")
+st.title("🧮 Math Chatbot — LLM assisted (multimodal-ready)")
+st.caption("Understands natural questions via an LLM, computes exactly with SymPy. Upload image/audio/PDF if you want; I’ll route automatically.")
 
 # ---------------- State ----------------
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # [{'role': 'user'|'assistant', 'content': str}]
+    st.session_state.messages = []
 
 # ---------------- Helpers ----------------
 def to_latex(obj) -> str:
@@ -32,69 +44,6 @@ def to_latex(obj) -> str:
         return sp.latex(obj)
     except Exception:
         return str(obj)
-
-def extract_expression(text: str) -> str:
-    """
-    Pull the math expression out of a natural-language prompt.
-    e.g., "what's the derivative of x^2?" -> "x^2"
-    """
-    t = (text or "").strip()
-    t = t.replace("’", "'").lower()
-
-    # quick phrase normalizations
-    t = t.replace("what is", "whatis").replace("what's", "whats")
-
-    patterns = [
-        r"derivative of (.*)",
-        r"differentiate (.*)",
-        r"integral of (.*)",
-        r"integrate (.*)",
-        r"limit of (.*)",
-        r"whatis (.*)",
-        r"whats (.*)",
-        r"solve (.*)",
-        r"simplify (.*)",
-        r"expand (.*)",
-        r"factor (.*)",
-    ]
-    for p in patterns:
-        m = re.search(p, t)
-        if m:
-            expr = m.group(1)
-            # strip common tails
-            expr = re.sub(r"( with respect to .*| wrt .*| please| thanks|[?.!])+$", "", expr).strip()
-            # handle "as x->..." for limits (keep it in full query; math_engine handles)
-            return expr if not p.startswith("limit") else text
-    return text
-    
-def detect_math_op(raw: str):
-    """
-    Return (op, payload) where op in {'derivative','integral','limit','solve','simplify',None}.
-    payload is a dict with fields used by the op.
-    """
-    t = (raw or "").lower().replace("’","'")
-    # derivative
-    m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
-    if m:
-        return "derivative", {"expr": m.group(1).strip()}
-    # integral (definite: "... from a to b")
-    m = re.search(r"(?:integral|integrate)\s+(?:of\s+)?(.+?)\s*(?:from\s+([^\s]+)\s+to\s+([^\s]+))?$", t)
-    if m:
-        return "integral", {"expr": m.group(1).strip(), "a": m.group(2), "b": m.group(3)}
-    # limit: "limit (expr) as x->value"
-    m = re.search(r"limit\s*(.+?)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", t)
-    if m:
-        return "limit", {"expr": m.group(1).strip(), "var": m.group(2), "to": m.group(3)}
-    # solve (systems allowed later)
-    m = re.search(r"(?:solve|roots|solution)\s+(.+)", t)
-    if m:
-        return "solve", {"expr": m.group(1).strip()}
-    # simplify/factor/expand
-    m = re.search(r"(simplify|factor|expand)\s+(.+)", t)
-    if m:
-        return m.group(1).lower(), {"expr": m.group(2).strip()}
-    return None, {}
-
 
 def infer_intent(text: str, has_image: bool, has_audio: bool, has_pdf: bool) -> str:
     t = (text or "").lower()
@@ -108,12 +57,12 @@ def infer_intent(text: str, has_image: bool, has_audio: bool, has_pdf: bool) -> 
 
 MATH_HELP = (
     "I can help with:\n"
-    "• Calculus: limits, derivatives (partial), integrals, series (Taylor/Maclaurin)\n"
+    "• Calculus: limits, derivatives, partials, integrals, series\n"
     "• Algebra: solve equations/systems, simplify/factor/expand, inequalities\n"
     "• Linear algebra: matrices (det, rank, inverse), eigenvalues/vectors\n"
     "• Number theory: gcd/lcm, prime factorization, modular inverse\n"
     "Examples:\n"
-    "- differentiate sin(x)^2\n"
+    "- derivative of sin(x)^2\n"
     "- integrate x^2 from 0 to 1\n"
     "- limit (1+1/n)^n as n->oo\n"
     "- solve {x+y=3, x-y=1}\n"
@@ -121,7 +70,78 @@ MATH_HELP = (
     "- matrix eigenvalues [[1,2],[3,4]]\n"
 )
 
-# ---------------- Math Engine ----------------
+# ---------- Lightweight regex (local) fallback intent+parse ----------
+def detect_math_op_local(raw: str):
+    t = (raw or "").lower().replace("’","'")
+    # derivative
+    m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
+    if m: return "derivative", {"expr": m.group(1).strip()}
+    # integral (optional bounds)
+    m = re.search(r"(?:integral|integrate)\s+(?:of\s+)?(.+?)\s*(?:from\s+([^\s]+)\s+to\s+([^\s]+))?$", t)
+    if m: return "integral", {"expr": m.group(1).strip(), "a": m.group(2), "b": m.group(3)}
+    # limit
+    m = re.search(r"limit\s*(.+?)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", t)
+    if m: return "limit", {"expr": m.group(1).strip(), "var": m.group(2), "to": m.group(3)}
+    # solve
+    m = re.search(r"(?:solve|roots|solution)\s+(.+)", t)
+    if m: return "solve", {"expr": m.group(1).strip()}
+    # simplify/factor/expand
+    m = re.search(r"(simplify|factor|expand)\s+(.+)", t)
+    if m: return m.group(1).lower(), {"expr": m.group(2).strip()}
+    return None, {}
+
+# ---------- LLM router+parser ----------
+LLM_PARSE_SYS = (
+    "You convert natural-language math questions into a JSON instruction for a CAS (SymPy). "
+    "Return compact JSON with keys: op in {derivative,integral,limit,solve,simplify,factor,expand,none}, "
+    "expr (string SymPy-friendly), a (lower bound, optional), b (upper bound, optional), "
+    "var (symbol for limit), to (target for limit). If you cannot parse, return op:'none'. "
+    "Do not include any prose besides JSON."
+)
+
+def llm_parse_math(raw: str) -> Dict[str, Any]:
+    """Use LLM to robustly parse messy user text into a CAS-ready plan."""
+    if not OPENAI_AVAILABLE:
+        return {"op":"none"}
+    try:
+        prompt = f"User: {raw}\nReturn JSON only."
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role":"system","content":LLM_PARSE_SYS},
+                      {"role":"user","content":raw}],
+            temperature=0.0,
+        )
+        text = resp.choices[0].message.content.strip()
+        # Extract JSON (tolerate leading/trailing text just in case)
+        import json
+        start = text.find("{"); end = text.rfind("}")
+        obj = json.loads(text[start:end+1]) if start!=-1 and end!=-1 else json.loads(text)
+        # normalize
+        obj.setdefault("op","none")
+        return obj
+    except Exception:
+        return {"op":"none"}
+
+# ---------- LLM explainer (optional pretty steps) ----------
+LLM_EXPLAIN_SYS = (
+    "You are a math TA. Given a user's question and CAS result, explain steps clearly in 3-6 short bullets. "
+    "Use LaTeX inline when helpful; keep it concise."
+)
+def llm_explain(user_q: str, result_text: str) -> Optional[str]:
+    if not OPENAI_AVAILABLE:
+        return None
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role":"system","content":LLM_EXPLAIN_SYS},
+                      {"role":"user","content":f"Question: {user_q}\nCAS result: {result_text}"}],
+            temperature=0.2,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+# ---------------- Math Engine (LLM-assisted) ----------------
 def _parse_matrix(txt: str):
     try:
         m = ast.literal_eval(txt)
@@ -129,204 +149,87 @@ def _parse_matrix(txt: str):
     except Exception:
         return None
 
-def math_engine(query: str) -> str:
+def do_sympy_compute(op: str, info: Dict[str, Any]) -> str:
+    """Run the CAS operation with SymPy based on parsed plan."""
     if sp is None:
         return "SymPy isn't installed. Add `sympy` to requirements.txt."
-
-    # 1) Detect op on the RAW text
-    op, info = detect_math_op(query)
-
-    # 2) Then extract the expression (for nicer NL handling)
-    cleaned = extract_expression(query)
-    q = (cleaned or "").strip()
-
     x, y, z, n, t = sp.symbols("x y z n t")
 
-    # ---------- DERIVATIVE ----------
     if op == "derivative":
-        try:
-            expr = sp.sympify(info["expr"])
-            return f"d/dx {expr} = {sp.simplify(sp.diff(expr, x))}"
-        except Exception as e:
-            return f"Could not differentiate: {e}"
+        expr = sp.sympify(info["expr"])
+        return f"d/dx {expr} = {sp.simplify(sp.diff(expr, x))}"
 
-    # ---------- INTEGRAL ----------
     if op == "integral":
-        try:
-            expr = sp.sympify(info["expr"])
-            a, b = info.get("a"), info.get("b")
-            if a and b:
-                val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
-                return f"∫[{a},{b}] {expr} dx = {sp.simplify(val)}"
-            else:
-                return f"∫ {expr} dx = {sp.simplify(sp.integrate(expr, x))} + C"
-        except Exception as e:
-            return f"Could not compute integral: {e}"
+        expr = sp.sympify(info["expr"])
+        a, b = info.get("a"), info.get("b")
+        if a and b:
+            val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
+            return f"∫[{a},{b}] {expr} dx = {sp.simplify(val)}"
+        else:
+            return f"∫ {expr} dx = {sp.simplify(sp.integrate(expr, x))} + C"
 
-    # ---------- LIMIT ----------
     if op == "limit":
-        try:
-            var = sp.Symbol(info["var"])
-            expr = sp.sympify(info["expr"])
-            to_txt = info["to"]
-            to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else (-sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt))
-            res = sp.limit(expr, var, to_val)
-            return f"limit {expr} as {var}->{to_txt} = {sp.simplify(res)}"
-        except Exception as e:
-            return f"Could not compute limit: {e}"
+        var = sp.Symbol(info.get("var","x"))
+        expr = sp.sympify(info["expr"])
+        to_txt = info.get("to","oo")
+        to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else (-sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt))
+        res = sp.limit(expr, var, to_val)
+        return f"limit {expr} as {var}->{to_txt} = {sp.simplify(res)}"
 
-    # ---------- SOLVE / SIMPLIFY / FACTOR / EXPAND ----------
     if op == "solve":
-        try:
-            expr_txt = info["expr"]
-            if "{" in expr_txt and "}" in expr_txt:
-                inside = expr_txt[expr_txt.find("{")+1:expr_txt.rfind("}")]
-                eqs = [e.strip() for e in inside.split(",")]
-                symset, parsed = set(), []
-                for e in eqs:
-                    L, R = e.split("=")
-                    parsed.append(sp.Eq(sp.sympify(L), sp.sympify(R)))
-                    symset |= sp.sympify(L).free_symbols | sp.sympify(R).free_symbols
-                sol = sp.solve(parsed, list(symset))
-                return f"Solutions: {sol}"
-            if "=" in expr_txt:
-                L, R = expr_txt.split("=", 1)
-                sol = sp.solve(sp.Eq(sp.sympify(L), sp.sympify(R)))
-            else:
-                sol = sp.solve(sp.sympify(expr_txt))
+        expr_txt = info["expr"]
+        if "{" in expr_txt and "}" in expr_txt:
+            inside = expr_txt[expr_txt.find("{")+1:expr_txt.rfind("}")]
+            eqs = [e.strip() for e in inside.split(",")]
+            symset, parsed = set(), []
+            for e in eqs:
+                L, R = e.split("=")
+                parsed.append(sp.Eq(sp.sympify(L), sp.sympify(R)))
+                symset |= sp.sympify(L).free_symbols | sp.sympify(R).free_symbols
+            sol = sp.solve(parsed, list(symset))
             return f"Solutions: {sol}"
-        except Exception as e:
-            return f"Could not solve: {e}"
+        if "=" in expr_txt:
+            L, R = expr_txt.split("=", 1)
+            sol = sp.solve(sp.Eq(sp.sympify(L), sp.sympify(R)))
+        else:
+            sol = sp.solve(sp.sympify(expr_txt))
+        return f"Solutions: {sol}"
 
     if op in {"simplify","factor","expand"}:
-        try:
-            expr = sp.sympify(info["expr"])
-            if op == "factor":  return f"factor({expr}) = {sp.factor(expr)}"
-            if op == "expand":  return f"expand({expr}) = {sp.expand(expr)}"
-            return f"simplify({expr}) = {sp.simplify(expr)}"
-        except Exception as e:
-            return f"Could not process expression: {e}"
+        expr = sp.sympify(info["expr"])
+        if op == "factor":  return f"factor({expr}) = {sp.factor(expr)}"
+        if op == "expand":  return f"expand({expr}) = {sp.expand(expr)}"
+        return f"simplify({expr}) = {sp.simplify(expr)}"
 
-    # ---------- (rest of your handlers: matrix, number theory, fallback, etc.) ----------
-    # keep your existing matrix/number-theory blocks here...
-    # Fallback:
+    return "I couldn't parse that.\n\n" + MATH_HELP
+
+def math_engine(user_query: str, use_llm: bool) -> str:
+    """
+    1) Use LLM to parse op/expr if enabled; otherwise regex fallback.
+    2) Execute with SymPy.
+    3) Optionally add LLM explanation.
+    """
+    # 1) plan
+    plan = {"op":"none"}
+    if use_llm and OPENAI_AVAILABLE:
+        plan = llm_parse_math(user_query)
+
+    if plan.get("op") == "none":
+        op, info = detect_math_op_local(user_query)
+        plan = {"op": op or "none", **(info or {})}
+
+    # 2) compute
     try:
-        expr = sp.sympify(q)
-        return f"Parsed: ${to_latex(expr)}$\nSimplified: ${to_latex(sp.simplify(expr))}$"
-    except Exception:
-        return "I couldn't parse that.\n\n" + MATH_HELP
+        result = do_sympy_compute(plan.get("op","none"), plan)
+    except Exception as e:
+        result = f"Error while computing: {e}"
 
-
-    # ---- Matrix helpers ----
-    if "matrix" in q.lower() or q.strip().startswith("[["):
-        mtxt = re.search(r"\[\[.*\]\]", q.replace("\n", " "))
-        mat = _parse_matrix(mtxt.group(0) if mtxt else q)
-        if mat is None:
-            return "Couldn't parse the matrix. Try: matrix eigenvalues [[1,2],[3,4]]"
-        lower = q.lower()
-        if "eigen" in lower:
-            return f"Eigenvalues: {mat.eigenvals()}"
-        if "det" in lower:
-            return f"determinant = {mat.det()}"
-        if "rank" in lower:
-            return f"rank = {mat.rank()}"
-        if "inverse" in lower or "inv" in lower:
-            return f"inverse:\n{mat.inv()}"
-        return f"Matrix {mat.shape}:\n{mat}"
-
-    # ---- Limit: 'limit <expr> as x->oo' ----
-    lim = re.search(r"limit\s*(.*)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", q, re.I)
-    if lim and sp is not None:
-        expr_txt, var_txt, to_txt = lim.groups()
-        var = sp.Symbol(var_txt)
-        try:
-            expr = sp.sympify(expr_txt)
-            to_val = sp.oo if to_txt in ["oo","+inf","+infty","infinity"] else (-sp.oo if to_txt in ["-oo","-inf"] else sp.sympify(to_txt))
-            res = sp.limit(expr, var, to_val)
-            return f"limit {expr_txt} as {var_txt}->{to_txt} = {sp.simplify(res)}"
-        except Exception as e:
-            return f"Could not compute limit: {e}"
-
-    # ---- Derivative: 'differentiate ...' or natural '... derivative of ...' ----
-    if any(k in q.lower() for k in ["differentiate", "derivative", "d/dx", "derive"]):
-        expr_txt = re.sub(r"(?i)(differentiate|derivative|d/dx|derive)\s*", "", q)
-        try:
-            expr = sp.sympify(expr_txt)
-            res = sp.diff(expr, x)
-            return f"d/dx {expr} = {sp.simplify(res)}"
-        except Exception as e:
-            return f"Could not differentiate: {e}"
-
-    # If the cleaned query is a bare expression, try derivative when user asked naturally
-    if re.search(r"\bderivative\b|\bd/dx\b|\bdifferentiate\b", (query or "").lower()):
-        try:
-            expr = sp.sympify(extract_expression(query))
-            res = sp.diff(expr, x)
-            return f"d/dx {expr} = {sp.simplify(res)}"
-        except Exception as e:
-            return f"Could not differentiate: {e}"
-
-    # ---- Integral: 'integrate ...' or 'integral of ...' ----
-    if "integrate" in q.lower() or q.lower().startswith("∫") or "integral" in q.lower():
-        expr_txt = re.sub(r"(?i)(integrate|integral of)\s*", "", q)
-        bounds = re.search(r"from\s+([^\s]+)\s+to\s+([^\s]+)$", expr_txt)
-        try:
-            if bounds:
-                body = expr_txt[:bounds.start()].strip()
-                a, b = bounds.groups()
-                expr = sp.sympify(body)
-                val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
-                return f"∫[{a},{b}] {expr} dx = {sp.simplify(val)}"
-            expr = sp.sympify(expr_txt)
-            return f"∫ {expr} dx = {sp.simplify(sp.integrate(expr, x))} + C"
-        except Exception as e:
-            return f"Could not compute integral: {e}"
-
-    # ---- Solve equations / systems / inequalities ----
-    if any(k in q.lower() for k in ["solve", "roots", "solution", "inequality"]):
-        try:
-            if "inequality" in q.lower():
-                expr_txt = re.sub(r"(?i)solve\s*inequality\s*", "", q)
-                sol = sp.solve_univariate_inequality(sp.sympify(expr_txt), x, relational=True)
-                return f"Solution set: ${to_latex(sol)}$"
-            expr_txt = re.sub(r"(?i)(solve|roots|solution)\s*", "", q)
-            if "{" in expr_txt and "}" in expr_txt:  # system like {x+y=3, x-y=1}
-                inside = expr_txt[expr_txt.find("{")+1:expr_txt.rfind("}")]
-                eqs = [e.strip() for e in inside.split(",")]
-                symset = set()
-                parsed = []
-                for e in eqs:
-                    L, R = e.split("=")
-                    parsed.append(sp.Eq(sp.sympify(L), sp.sympify(R)))
-                    symset |= sp.sympify(L).free_symbols | sp.sympify(R).free_symbols
-                sol = sp.solve(parsed, list(symset))
-                return f"Solutions: {sol}"
-            if "=" in expr_txt:
-                L, R = expr_txt.split("=", 1)
-                sol = sp.solve(sp.Eq(sp.sympify(L), sp.sympify(R)))
-            else:
-                sol = sp.solve(sp.sympify(expr_txt))
-            return f"Solutions: {sol}"
-        except Exception as e:
-            return f"Could not solve: {e}"
-
-    # ---- Simplify / factor / expand ----
-    if any(k in q.lower() for k in ["simplify", "factor", "expand"]):
-        try:
-            expr_txt = re.sub(r"(?i)(simplify|factor|expand)\s*", "", q)
-            expr = sp.sympify(expr_txt)
-            if "factor" in q.lower():  return f"factor({expr}) = {sp.factor(expr)}"
-            if "expand" in q.lower():  return f"expand({expr}) = {sp.expand(expr)}"
-            return f"simplify({expr}) = {sp.simplify(expr)}"
-        except Exception as e:
-            return f"Could not process expression: {e}"
-
-    # ---- Fallback: just try to parse and simplify ----
-    try:
-        expr = sp.sympify(q)
-        return f"Parsed: ${to_latex(expr)}$\nSimplified: ${to_latex(sp.simplify(expr))}$"
-    except Exception:
-        return "I couldn't parse that.\n\n" + MATH_HELP
+    # 3) optional explanation from LLM
+    if use_llm and OPENAI_AVAILABLE:
+        expl = llm_explain(user_query, result)
+        if expl:
+            return result + "\n\n**Explanation**\n" + expl
+    return result
 
 # ---------------- Upload Handlers (stubs) ----------------
 def handle_image(file) -> str:
@@ -360,8 +263,14 @@ aud_file = st.sidebar.file_uploader("Upload audio (WAV/MP3/M4A)", type=["wav", "
 pdf_file = st.sidebar.file_uploader("Upload lecture PDF", type=["pdf"])
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("LLM settings")
+use_llm = st.sidebar.checkbox("Use LLM assistance (better parsing + explanations)", value=True)
+if use_llm and not OPENAI_AVAILABLE:
+    st.sidebar.warning("Set OPENAI_API_KEY env var or Streamlit secret to enable LLM.")
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Examples")
-st.sidebar.code("differentiate sin(x)^2", language="text")
+st.sidebar.code("derivative of x^2", language="text")
 st.sidebar.code("integrate x^2 from 0 to 1", language="text")
 st.sidebar.code("limit (1+1/n)^n as n->oo", language="text")
 st.sidebar.code("solve {x+y=3, x-y=1}", language="text")
@@ -394,7 +303,7 @@ if user_text:
     elif intent == "lecture":
         reply = "It sounds like you want to process lecture notes. Upload a PDF in the sidebar." if pdf_file is None else handle_pdf(pdf_file)
     else:
-        reply = math_engine(user_text)
+        reply = math_engine(user_text, use_llm=use_llm)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
     with st.chat_message("assistant"):
