@@ -333,7 +333,8 @@ def math_engine(prompt: str, use_llm: bool = True) -> str:
             m = re.search(r"from\s+([^\s]+)\s+to\s+([^\s]+)$", expr_txt, flags=re.I)
             expr_core = expr_txt[:m.start()].strip() if m else expr_txt
             expr_core = normalize_expr(expr_core)
-            expr = sp.sympify(expr_core)
+            expr = sp.sympify(expr_core, locals={"e": sp.E})
+
             if m:
                 a, b = m.group(1), m.group(2)
                 val = sp.integrate(expr, (x, sp.sympify(a), sp.sympify(b)))
