@@ -289,34 +289,60 @@ def do_sympy_compute(op: str, info: Dict[str, Any]) -> str:
 
     return "I couldn't parse that.\n\n" + MATH_HELP
 
-def math_engine(user_query: str, use_llm: bool) -> str:
+def math_engine(prompt: str, client: OpenAI):
     """
-    1) Use LLM to parse op/expr if enabled; otherwise regex fallback.
-    2) Execute with SymPy.
-    3) Optionally add LLM explanation.
+    Hybrid reasoning engine:
+    - Try symbolic math with Sympy
+    - Fallback to LLM (GPT-4o-mini) for natural explanations, typos, or open questions
     """
-    # 1) plan
-    plan = {"op":"none"}
-    if use_llm and OPENAI_AVAILABLE:
-        plan = llm_parse_math(user_query)
 
-    if plan.get("op") == "none":
-        op, info = detect_math_op_local(user_query)
-        plan = {"op": op or "none", **(info or {})}
+    x = sp.Symbol("x")
+    lower = prompt.lower().strip()
 
-    # 2) compute
+    # -------- 1️⃣  Try Sympy parsing  --------
     try:
-        result = do_sympy_compute(plan.get("op","none"), plan)
+        # normalize text
+        if "derivative" in lower or "differentiate" in lower:
+            expr = prompt.replace("derivative of", "").replace("differentiate", "")
+            expr = sp.sympify(expr)
+            deriv = sp.diff(expr, x)
+            return f"d/dx {sp.latex(expr)} = {sp.latex(deriv)}"
+
+        if "integrate" in lower:
+            expr = prompt.replace("integrate", "")
+            expr = sp.sympify(expr)
+            integ = sp.integrate(expr, x)
+            return f"∫ {sp.latex(expr)} dx = {sp.latex(integ)} + C"
+
+        if "limit" in lower:
+            # example: limit (1+1/n)^n as n->oo
+            parts = prompt.replace("limit", "").replace("as", "").replace("→", "->").split("->")
+            if len(parts) == 2:
+                expr_str, point = parts
+                var = sp.Symbol("n")
+                expr = sp.sympify(expr_str.strip().replace("=", ""))
+                val = sp.limit(expr, var, sp.oo if "oo" in point else sp.sympify(point))
+                return f"lim {sp.latex(expr)} = {sp.latex(val)}"
+    except Exception:
+        pass
+
+    # -------- 2️⃣  If Sympy fails, ask the LLM  --------
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "You are a math tutor. "
+                    "Explain reasoning clearly, fix typos, and compute if possible. "
+                    "Always format math in LaTeX when relevant."
+                )},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        result = f"Error while computing: {e}"
-
-    # 3) optional explanation from LLM
-    if use_llm and OPENAI_AVAILABLE:
-        expl = llm_explain(user_query, result)
-        if expl:
-            return result + "\n\n**Explanation**\n" + expl
-    return result
-
+        return f"Error contacting LLM: {e}"
 # ---------------- Upload Handlers (stubs) ----------------
 def handle_image(file) -> str:
     name = getattr(file, "name", "uploaded_image")
