@@ -478,4 +478,12 @@ if user_text:
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
     with st.chat_message("assistant"):
-        st.write(reply)
+        # if the reply contains LaTeX, render it nicely
+        if "\\" in reply or "$" in reply:
+            try:
+                st.latex(reply.replace("$$", "$"))  # handles inline and block
+            except Exception:
+                st.markdown(reply)
+        else:
+            st.markdown(reply)
+
