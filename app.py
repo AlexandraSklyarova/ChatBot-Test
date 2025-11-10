@@ -332,6 +332,20 @@ def math_engine(prompt: str, use_llm: bool = True) -> str:
             return do_sympy_compute(plan["op"], plan)
         except Exception:
             pass
+    # 2.5) Bare expression fallback: try to parse/evaluate plain math like "9+10"
+    try:
+        expr = try_parse(prompt)
+        val = sp.simplify(expr)
+        # If it simplifies to a number, just show the value; otherwise show both
+        if val.is_Number:
+            return f"$${to_latex(val)}$$"
+        # show "expr = simplified"
+        if val != expr:
+            return f"$${to_latex(expr)} = {to_latex(val)}$$"
+        else:
+            return f"$${to_latex(expr)}$$"
+    except Exception:
+        pass
 
     # 3) LLM-assisted parsing + explanation (optional)
     if use_llm and OPENAI_AVAILABLE:
