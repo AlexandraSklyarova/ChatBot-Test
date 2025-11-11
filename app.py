@@ -80,12 +80,9 @@ MATH_HELP = (
 # ---------------- Pretty rendering helpers ----------------
 def _latex_clean(s: str) -> str:
     """Normalize common outputs to valid LaTeX."""
-    # \[...\] -> $$...$$
-    s = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", s, flags=re.S)
-    # \to oo -> \to \infty
-    s = re.sub(r"(?<=\\to)\s*oo", r" \\infty", s)
+    s = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", s, flags=re.S)          # \[...\] -> $$...$$
+    s = re.sub(r"(?<=\\to)\s*oo", r" \\infty", s)                   # \to oo -> \to \infty
     s = re.sub(r"\\lim_\{([^}]*)\\to\s*oo\}", r"\\lim_{\1\\to \\infty}", s)
-    # collapse accidental $$$$
     s = s.replace("$$$$", "$$")
     return s.strip()
 
@@ -94,13 +91,8 @@ def render_reply(reply: str):
     if not isinstance(reply, str):
         st.markdown(str(reply)); return
     txt = _latex_clean(reply)
-
-    # single display-math block
     if txt.startswith("$$") and txt.endswith("$$"):
-        st.latex(txt.strip("$"))
-        return
-
-    # split into blocks: $$...$$ as LaTeX, rest as markdown
+        st.latex(txt.strip("$")); return
     blocks = re.split(r"(\$\$.*?\$\$)", txt, flags=re.S)
     for b in blocks:
         if not b:
@@ -117,7 +109,7 @@ _KEYWORDS = ["derivative", "differentiate", "d/dx",
              "integral", "integrate",
              "limit",
              "solve", "solution", "roots",
-             "simplify", "factor", "expand"]
+             "simplify", "factor", "expand", "explain"]
 
 def fuzzy_fix_keyword(word: str, cutoff=0.75):
     m = difflib.get_close_matches(word, _KEYWORDS, n=1, cutoff=cutoff)
@@ -132,14 +124,12 @@ def fuzzy_fix_ops(text: str) -> str:
     return " ".join(toks)
 
 def insert_parens_after_func(expr: str) -> str:
-    """
-    sinx -> sin(x), sin 2x -> sin(2*x), ln x -> log(x), sqrtx -> sqrt(x)
-    """
-    expr = re.sub(r"\b(ln)\b", "log", expr)  # ln -> log
+    """sinx -> sin(x), sin 2x -> sin(2*x), ln x -> log(x), sqrtx -> sqrt(x)"""
+    expr = re.sub(r"\b(ln)\b", "log", expr)
     for func in ["sin","cos","tan","cot","sec","csc","log","sqrt"]:
-        expr = re.sub(rf"\b{func}\s*([a-zA-Z]\b)", rf"{func}(\1)", expr)     # sin x -> sin(x)
-        expr = re.sub(rf"\b{func}([a-zA-Z])\b",     rf"{func}(\1)", expr)     # sinx  -> sin(x)
-        expr = re.sub(rf"\b{func}\s*(\d+[a-zA-Z])", rf"{func}(\1)", expr)     # sin 2x -> sin(2x)
+        expr = re.sub(rf"\b{func}\s*([a-zA-Z]\b)", rf"{func}(\1)", expr)
+        expr = re.sub(rf"\b{func}([a-zA-Z])\b",     rf"{func}(\1)", expr)
+        expr = re.sub(rf"\b{func}\s*(\d+[a-zA-Z])", rf"{func}(\1)", expr)
     return expr
 
 def balance_parens(expr: str) -> str:
@@ -156,9 +146,9 @@ from sympy.parsing.sympy_parser import (
     function_exponentiation,
 )
 _TRANSFORMS = standard_transformations + (
-    implicit_multiplication_application,  # 2x -> 2*x , (x+1)(x-1) -> ...
-    convert_xor,                          # x^2 stays exponent
-    function_exponentiation,              # sin^2(x) -> sin(x)**2
+    implicit_multiplication_application,
+    convert_xor,
+    function_exponentiation,
 )
 
 def try_parse(expr_txt: str):
@@ -166,7 +156,6 @@ def try_parse(expr_txt: str):
     s = (expr_txt or "").strip().replace("’", "'")
     s = insert_parens_after_func(s)
     s = balance_parens(s)
-    # Treat 'e' as Euler's number
     locals_map = {"e": sp.E} if sp else {}
     return parse_expr(s, transformations=_TRANSFORMS, evaluate=True, local_dict=locals_map)
 
@@ -178,36 +167,30 @@ def detect_math_op_local(raw: str):
     t = (raw or "").strip()
     t = fuzzy_fix_ops(t.lower().replace("’","'"))
 
-    # ---- explain / what is / define / why queries ----
+    # explain / what is / define / why queries
     m = re.search(r"^(explain|what\s+is|define|why\s+is|intuition\s+for)\s+(.+)$", t)
     if m:
         topic = m.group(2).strip(" ?.")
         return "explain", {"topic": topic}
 
-    # derivative
     m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
     if m: return "derivative", {"expr": m.group(1).strip()}
 
-    # integral (optional bounds)
     m = re.search(r"(?:integral|integrate)\s+(?:of\s+)?(.+?)\s*(?:from\s+([^\s]+)\s+to\s+([^\s]+))?$", t)
     if m: return "integral", {"expr": m.group(1).strip(), "a": m.group(2), "b": m.group(3)}
 
-    # limit
     m = re.search(r"limit\s*(.+?)\s*as\s*([a-zA-Z])\s*->\s*([^\s]+)", t)
     if m: return "limit", {"expr": m.group(1).strip(), "var": m.group(2), "to": m.group(3)}
 
-    # solve
     m = re.search(r"(?:solve|roots|solution)\s+(.+)", t)
     if m: return "solve", {"expr": m.group(1).strip()}
 
-    # simplify/factor/expand
     m = re.search(r"(simplify|factor|expand)\s+(.+)", t)
     if m: return m.group(1).lower(), {"expr": m.group(2).strip()}
 
     return None, {}
 
-
-# ---------- LLM router+parser (optional) ----------
+# ---------- LLM helpers ----------
 LLM_PARSE_SYS = (
     "You convert natural-language math questions into a JSON instruction for a CAS (SymPy). "
     "Return compact JSON with keys: op in {derivative,integral,limit,solve,simplify,factor,expand,none}, "
@@ -252,14 +235,14 @@ def llm_explain(user_q: str, result_text: str) -> Optional[str]:
         return resp.choices[0].message.content.strip()
     except Exception:
         return None
-# ---------- LLM concept explainer + offline fallback ----------
+
+# Concept explainer + offline fallback
 LLM_EXPLAIN_CONCEPT_SYS = (
     "You are a kind math TA. Explain the requested math concept clearly in 6-10 short bullets, "
     "with 1-2 tiny worked examples. Prefer symbols and LaTeX where helpful. "
     "Keep each bullet concise. Avoid unnecessary history or trivia."
 )
 
-# very short offline snippets for when LLM is unavailable
 _OFFLINE_KB = {
     "derivative": r"""
 **Derivative (intuition):**
@@ -293,6 +276,14 @@ _OFFLINE_KB = {
 - Equals pivot count in row-reduced echelon form.
 - Dimension of the image of the linear map.
 """,
+    "complex numbers": r"""
+**Complex Numbers:**
+- Extend the reals by \(i\) where \(i^2=-1\).
+- General form \(z=a+bi\) with \(a,b\in\mathbb{R}\); conjugate \(\overline z=a-bi\).
+- Magnitude \(|z|=\sqrt{a^2+b^2}\); argument \(\arg z\) is the angle in the plane.
+- Multiplication adds arguments and multiplies magnitudes.
+- Example: \((1+i)(2-i)=3+i\).
+""",
 }
 
 def llm_explain_concept(topic: str) -> str:
@@ -309,9 +300,8 @@ def llm_explain_concept(topic: str) -> str:
                 temperature=0.2,
             )
             return resp.choices[0].message.content.strip()
-        except Exception as e:
+        except Exception:
             pass  # fall through to offline
-    # offline fallback
     key = t.lower().strip()
     for k in _OFFLINE_KB:
         if k in key:
@@ -387,16 +377,31 @@ def do_sympy_compute(op: str, info: Dict[str, Any]) -> str:
 
 def math_engine(prompt: str, use_llm: bool = True) -> str:
     """
-    1) Try to parse intent locally (typo tolerant).
-    2) Execute with SymPy (robust parser).
-    3) If that fails and LLM is enabled, ask LLM to parse/explain, then compute again if possible.
+    1) Concept queries -> explainer (LLM/offline).
+    2) Try to parse intent locally (typo tolerant).
+    3) Execute with SymPy (robust parser).
+    4) Bare expression fallback (e.g., '9+10').
+    5) LLM-assisted parsing/explanation if still unresolved.
     """
     if sp is None:
         return "SymPy isn't installed. Add `sympy` to requirements.txt."
 
+    raw = (prompt or "").strip()
+
+    # --- Early: detect concept explanations before any CAS work ---
+    if re.match(r"(?i)\b(explain|what\s+is|define|why\s+is|intuition\s+for)\b", raw):
+        topic = re.sub(r"(?i)\b(explain|what\s+is|define|why\s+is|intuition\s+for)\b", "", raw).strip(" ?.")
+        topic = topic or raw
+        return llm_explain_concept(topic)
+
     # 1) Plan via local detector
-    op, info = detect_math_op_local(prompt)
+    op, info = detect_math_op_local(raw)
     plan = {"op": op or "none", **(info or {})}
+
+    # 1.5) If detector says "explain", route to explainer
+    if plan["op"] == "explain":
+        topic = plan.get("topic", raw)
+        return llm_explain_concept(topic)
 
     # 2) Compute with SymPy if possible
     if plan["op"] != "none":
@@ -404,14 +409,13 @@ def math_engine(prompt: str, use_llm: bool = True) -> str:
             return do_sympy_compute(plan["op"], plan)
         except Exception:
             pass
-    # 2.5) Bare expression fallback: try to parse/evaluate plain math like "9+10"
+
+    # 3) Bare expression fallback
     try:
-        expr = try_parse(prompt)
+        expr = try_parse(raw)
         val = sp.simplify(expr)
-        # If it simplifies to a number, just show the value; otherwise show both
-        if val.is_Number:
+        if getattr(val, "is_Number", False):
             return f"$${to_latex(val)}$$"
-        # show "expr = simplified"
         if val != expr:
             return f"$${to_latex(expr)} = {to_latex(val)}$$"
         else:
@@ -419,22 +423,21 @@ def math_engine(prompt: str, use_llm: bool = True) -> str:
     except Exception:
         pass
 
-    # 3) LLM-assisted parsing + explanation (optional)
+    # 4) LLM-assisted parsing + explanation (optional)
     if use_llm and OPENAI_AVAILABLE:
-        plan = llm_parse_math(prompt)
+        plan = llm_parse_math(raw)
         if plan.get("op") != "none":
             try:
                 result = do_sympy_compute(plan["op"], plan)
-                expl = llm_explain(prompt, result)
+                expl = llm_explain(raw, result)
                 return result + ("\n\n" + expl if expl else "")
             except Exception:
-                # fall back to direct LLM answer (reason/explain)
                 try:
                     resp = client.chat.completions.create(
                         model=OPENAI_MODEL,
                         messages=[
                             {"role":"system","content":"You are a helpful math tutor. Use LaTeX for math, be concise."},
-                            {"role":"user","content":prompt}
+                            {"role":"user","content":raw}
                         ],
                         temperature=0.2,
                     )
@@ -486,11 +489,13 @@ if use_llm and not OPENAI_AVAILABLE:
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Examples")
+st.sidebar.code("explain complex numbers", language="text")
 st.sidebar.code("derivative of sinx", language="text")
 st.sidebar.code("integrate e^x", language="text")
 st.sidebar.code("limit (1+1/n)^n as n->oo", language="text")
 st.sidebar.code("solve {x+y=3, x-y=1}", language="text")
 st.sidebar.code("matrix eigenvalues [[1,2],[3,4]]", language="text")
+st.sidebar.code("9+10", language="text")
 
 # ---------------- Chat history ----------------
 for m in st.session_state.messages:
