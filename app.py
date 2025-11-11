@@ -172,11 +172,17 @@ def try_parse(expr_txt: str):
 
 def detect_math_op_local(raw: str):
     """
-    Typo-tolerant intent detection for basic ops.
-    Returns (op, info) where op∈{derivative,integral,limit,solve,simplify,factor,expand,None}.
+    Typo-tolerant intent detection for basic ops + 'explain' concept queries.
+    Returns (op, info) where op∈{derivative,integral,limit,solve,simplify,factor,expand,explain,None}.
     """
     t = (raw or "").strip()
     t = fuzzy_fix_ops(t.lower().replace("’","'"))
+
+    # ---- explain / what is / define / why queries ----
+    m = re.search(r"^(explain|what\s+is|define|why\s+is|intuition\s+for)\s+(.+)$", t)
+    if m:
+        topic = m.group(2).strip(" ?.")
+        return "explain", {"topic": topic}
 
     # derivative
     m = re.search(r"(?:what(?:'|)s\s+the\s+)?(?:derivative|differentiate|d/dx)\s+(?:of\s+)?(.+)", t)
@@ -199,6 +205,7 @@ def detect_math_op_local(raw: str):
     if m: return m.group(1).lower(), {"expr": m.group(2).strip()}
 
     return None, {}
+
 
 # ---------- LLM router+parser (optional) ----------
 LLM_PARSE_SYS = (
@@ -245,6 +252,71 @@ def llm_explain(user_q: str, result_text: str) -> Optional[str]:
         return resp.choices[0].message.content.strip()
     except Exception:
         return None
+# ---------- LLM concept explainer + offline fallback ----------
+LLM_EXPLAIN_CONCEPT_SYS = (
+    "You are a kind math TA. Explain the requested math concept clearly in 6-10 short bullets, "
+    "with 1-2 tiny worked examples. Prefer symbols and LaTeX where helpful. "
+    "Keep each bullet concise. Avoid unnecessary history or trivia."
+)
+
+# very short offline snippets for when LLM is unavailable
+_OFFLINE_KB = {
+    "derivative": r"""
+**Derivative (intuition):**
+- Measures *instantaneous rate of change* (slope of the tangent line).
+- Definition: \( f'(x)=\lim_{h\to 0}\frac{f(x+h)-f(x)}{h} \).
+- Rules: \( \frac{d}{dx}x^n = nx^{n-1}\), \( (\sin x)' = \cos x\), \( (e^x)'=e^x\).
+- Example: \( f(x)=x^2 \Rightarrow f'(x)=2x\).
+""",
+    "integral": r"""
+**Integral (intuition):**
+- Accumulated quantity / signed area under curve.
+- Indefinite: \( \int f(x)\,dx = F(x)+C\) where \(F' = f\).
+- Definite: \( \int_a^b f(x)\,dx = F(b)-F(a)\).
+- Example: \( \int x^2 dx = \frac{x^3}{3}+C\).
+""",
+    "limit": r"""
+**Limit (intuition):**
+- What \(f(x)\) approaches as \(x\) approaches a value.
+- Notation: \( \lim_{x\to a} f(x) \).
+- Example: \( \lim_{n\to\infty}\left(1+\frac{1}{n}\right)^n=e\).
+""",
+    "eigenvalues": r"""
+**Eigenvalues / Eigenvectors:**
+- \(A v = \lambda v\) with \(v\neq 0\). \(v\): eigenvector, \(\lambda\): eigenvalue.
+- Solve \(\det(A-\lambda I)=0\) for \(\lambda\); then solve \((A-\lambda I)v=0\) for \(v\).
+- Example \( \begin{bmatrix}1&2\\3&4\end{bmatrix}\): \(\lambda=\frac{5\pm\sqrt{33}}{2}\).
+""",
+    "rank": r"""
+**Matrix Rank:**
+- Number of linearly independent rows/columns.
+- Equals pivot count in row-reduced echelon form.
+- Dimension of the image of the linear map.
+""",
+}
+
+def llm_explain_concept(topic: str) -> str:
+    """Explain a concept with the LLM; fallback to a tiny offline note."""
+    t = (topic or "").strip()
+    if OPENAI_AVAILABLE:
+        try:
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role":"system","content":LLM_EXPLAIN_CONCEPT_SYS},
+                    {"role":"user","content":f"Explain this concept: {t}"}
+                ],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            pass  # fall through to offline
+    # offline fallback
+    key = t.lower().strip()
+    for k in _OFFLINE_KB:
+        if k in key:
+            return _OFFLINE_KB[k]
+    return f"Concept explanation unavailable offline for '{t}'. Enable LLM in the sidebar to get a detailed explanation."
 
 # ---------------- Math Engine (LLM-assisted) ----------------
 def _parse_matrix(txt: str):
